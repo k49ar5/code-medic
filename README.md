@@ -34,6 +34,8 @@ The agent is built as a state machine using LangGraph, following the ReAct (Reas
    ```bash
    ollama pull llama3
 2. Install requirements:
-  pip install langgraph langchain_ollama langchain_community
-3. Run the agent:
+   ```bash
+   pip install langgraph langchain_ollama langchain_community
+4. Run the agent:
+    ```bash
    python main.py
