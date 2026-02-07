@@ -1,87 +1,117 @@
 import os
 import sys
+import re
+import logging
 import subprocess
 import tempfile
-from typing import Annotated, TypedDict, List
+from typing import TypedDict, List, Dict, Any, Optional
+
+# Core LangChain & LangGraph imports
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langgraph.graph import StateGraph, END
 from langchain_community.utils.math import cosine_similarity
 
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# --- 1. STATE DEFINITION ---
+# --- CONFIGURATION ---
+# It is recommended to use environment variables or a .env file for sensitive keys
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
+os.environ["LANGCHAIN_API_KEY"] = "YOUR_API_KEY"
+os.environ["LANGCHAIN_PROJECT"] = "Llama-3.2-Code-Repair-Production"
+
+MODEL_NAME = "llama3.2:1b"
+
+
+# --- STATE DEFINITION ---
 class AgentState(TypedDict):
+    """
+    Represents the internal state of the agent.
+    """
     code: str
     error: str
     docs: List[str]
-    best_doc: str
+    best_doc: Optional[str]
     iterations: int
-    max_iterations: int  # Safeguard against infinite loops
+    max_iterations: int
     fixed: bool
-    history: List[str]  # Agent's short-term memory to avoid repeating mistakes
+    history: List[str]
 
 
-# Initialize Local LLM (Llama 3)
-# Temperature 0 is crucial for consistent code generation
-llm = OllamaLLM(model="llama3", temperature=0)
-embeddings = OllamaEmbeddings(model="llama3")
-
-
-# --- 2. NODES (Function Definitions) ---
-
-def retrieve_docs(state: AgentState):
+# --- UTILITIES ---
+def extract_python_code(text: str) -> str:
     """
-    Simulates a Vector Database retrieval.
-    In a production app, this would be a Qdrant/ChromaDB query.
+    Robustly extracts python code from LLM markdown response.
     """
-    print("--- [NODE: Retrieval] Fetching candidates from documentation ---")
-    raw_docs = [
+    pattern = r"```python\s*(.*?)\s*```"
+    match = re.search(pattern, text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    # Fallback to removing backticks if block not specified correctly
+    return text.replace("```", "").strip()
+
+
+# --- NODES ---
+
+def retrieve_docs(state: AgentState) -> Dict[str, Any]:
+    """
+    Node: Context Retrieval.
+    Fetches relevant documentation snippets for the current error.
+    """
+    logger.info("Retrieving documentation candidates")
+
+    # Static knowledge base for demonstration purposes
+    knowledge_base = [
         "Python Syntax: Function definitions must end with a colon (:).",
         "Common Error: SyntaxError often occurs due to unclosed parentheses or missing quotes.",
         "Best Practice: print() function requires string arguments to be quoted.",
-        "Tip: Use f-strings for variable interpolation in Python 3.6+."
+        "Variable Interpolation: Use f-strings (f'...') for dynamic strings in Python 3.6+."
     ]
-    return {"docs": raw_docs}
+    return {"docs": knowledge_base}
 
 
-def rerank_docs(state: AgentState):
+def rerank_docs(state: AgentState) -> Dict[str, Any]:
     """
-    Two-Stage Retrieval: Using Cosine Similarity to select the most relevant snippet.
-    This reduces noise and saves context window space.
+    Node: Semantic Re-ranking.
+    Uses embeddings to find the most relevant document snippet to the error.
     """
-    print("--- [NODE: Re-ranker] Selecting most relevant context ---")
-    query_emb = embeddings.embed_query(state["error"])
-    doc_embs = embeddings.embed_documents(state["docs"])
+    logger.info("Selecting most relevant documentation snippet via Cosine Similarity")
 
-    scores = cosine_similarity([query_emb], doc_embs)[0]
-    best_index = scores.argmax()
+    embedder = OllamaEmbeddings(model=MODEL_NAME)
 
-    return {"best_doc": state["docs"][best_index]}
+    query_vector = embedder.embed_query(state["error"])
+    doc_vectors = embedder.embed_documents(state["docs"])
+
+    similarities = cosine_similarity([query_vector], doc_vectors)[0]
+    best_idx = similarities.argmax()
+
+    return {"best_doc": state["docs"][best_idx]}
 
 
-def repair_code(state: AgentState):
+def repair_code(state: AgentState) -> Dict[str, Any]:
     """
-    The Reasoning Node: Injects current error, documentation, and history
-    into the prompt to guide the LLM.
+    Node: Logic Repair.
+    Utilizes the LLM to provide a fix based on context and history.
     """
-    print(f"--- [NODE: Repair] Attempt {state['iterations'] + 1} ---")
+    logger.info(f"Initiating repair attempt {state['iterations'] + 1}")
 
-    # We pass the last failed attempt to the model to prevent logical loops
-    attempts_history = "\n".join(state["history"][-2:])
+    llm = OllamaLLM(model=MODEL_NAME, temperature=0)
 
-    prompt = f"""
-    Current Code: {state['code']}
-    Error encountered: {state['error']}
-    Context from Docs: {state['best_doc']}
+    prompt = (
+        "SYSTEM: You are a senior Python developer. Fix the provided code based on the error and context.\n"
+        f"CONTEXT: {state['best_doc']}\n"
+        f"ERROR: {state['error']}\n"
+        f"CURRENT_CODE: {state['code']}\n\n"
+        "INSTRUCTION: Return ONLY the corrected code inside a ```python code block. No explanations."
+    )
 
-    Previous failed attempts:
-    {attempts_history}
-
-    Instruction: Fix the code. Use only the provided context. 
-    Do not repeat previous mistakes. Return ONLY the raw code.
-    """
-
-    response = llm.invoke(prompt)
-    clean_code = response.strip().replace("```python", "").replace("```", "")
+    raw_response = llm.invoke(prompt)
+    clean_code = extract_python_code(raw_response)
 
     return {
         "code": clean_code,
@@ -90,92 +120,110 @@ def repair_code(state: AgentState):
     }
 
 
-def test_code(state: AgentState):
+def validate_code(state: AgentState) -> Dict[str, Any]:
     """
-    The Validation Node: Executes the code in a subprocess to get
-    real feedback from the Python interpreter.
+    Node: Runtime Validation.
+    Executes the code in an isolated subprocess to verify the fix.
     """
-    print("--- [NODE: Validator] Executing code for verification ---")
+    logger.info("Executing runtime validation")
 
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode='w', encoding='utf-8') as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".py", mode='w', encoding='utf-8', delete=False) as tmp:
         tmp.write(state["code"])
         tmp_path = tmp.name
 
     try:
-        result = subprocess.run(
+        process = subprocess.run(
             [sys.executable, tmp_path],
             capture_output=True,
             text=True,
             timeout=5
         )
-        # Clean up temp file
-        os.remove(tmp_path)
 
-        if result.returncode == 0:
-            print(">> Success: Code executed without errors.")
+        if process.returncode == 0:
+            logger.info("Validation successful")
             return {"fixed": True, "error": ""}
-        else:
-            # Capture the last line of the traceback for the next iteration
-            last_err = result.stderr.strip().splitlines()[-1] if result.stderr else "Unknown error"
-            print(f">> Failure: {last_err}")
-            return {"fixed": False, "error": last_err}
+
+        # Capture the specific error message for the next iteration
+        error_msg = process.stderr.strip().splitlines()[-1] if process.stderr else "Runtime Error"
+        logger.warning(f"Validation failed: {error_msg}")
+        return {"fixed": False, "error": error_msg}
 
     except Exception as e:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+        logger.error(f"Execution failed: {str(e)}")
         return {"fixed": False, "error": str(e)}
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
-# --- 3. GRAPH CONSTRUCTION ---
+# --- GRAPH CONSTRUCTION ---
 
-def router(state: AgentState):
-    """Decides whether to retry or stop based on results and safeguards."""
+def execution_router(state: AgentState) -> str:
+    """
+    Determines the next step in the workflow.
+    """
     if state["fixed"]:
         return "end"
     if state["iterations"] >= state["max_iterations"]:
-        print(">> Safeguard: Max iterations reached. Stopping.")
+        logger.error("Max iterations reached. Agent failed to fix code.")
         return "end"
     return "repair"
 
 
-workflow = StateGraph(AgentState)
+def build_workflow() -> StateGraph:
+    builder = StateGraph(AgentState)
 
-# Add Nodes
-workflow.add_node("retrieve", retrieve_docs)
-workflow.add_node("rerank", rerank_docs)
-workflow.add_node("repair", repair_code)
-workflow.add_node("test", test_code)
+    # Define Nodes
+    builder.add_node("retrieve", retrieve_docs)
+    builder.add_node("rerank", rerank_docs)
+    builder.add_node("repair", repair_code)
+    builder.add_node("validate", validate_code)
 
-# Build Edges
-workflow.set_entry_point("retrieve")
-workflow.add_edge("retrieve", "rerank")
-workflow.add_edge("rerank", "repair")
-workflow.add_edge("repair", "test")
+    # Define Edges
+    builder.set_entry_point("retrieve")
+    builder.add_edge("retrieve", "rerank")
+    builder.add_edge("rerank", "repair")
+    builder.add_edge("repair", "validate")
 
-# Add Conditional Logic (The Loop)
-workflow.add_conditional_edges(
-    "test",
-    router,
-    {"end": END, "repair": "repair"}
-)
+    # Add Conditional Routing
+    builder.add_conditional_edges(
+        "validate",
+        execution_router,
+        {
+            "end": END,
+            "repair": "repair"
+        }
+    )
 
-app = workflow.compile()
+    return builder.compile()
 
-# --- 4. EXECUTION ---
+
+# --- ENTRY POINT ---
 
 if __name__ == "__main__":
-    initial_input = {
-        "code": "def greet(): print('Hello World')",  # Missing colon (initially) or other syntax error
+    # Initialize the graph
+    app = build_workflow()
+
+    # Initial input data
+    initial_payload = {
+        "code": "def greet() print('Hello World')",  # Missing colon
         "error": "SyntaxError: expected ':'",
         "docs": [],
-        "best_doc": "",
+        "best_doc": None,
         "iterations": 0,
         "max_iterations": 3,
         "fixed": False,
         "history": []
     }
 
-    print("--- STARTING AGENTIC WORKFLOW ---")
-    for output in app.stream(initial_input):
-        for node, data in output.items():
-            print(f"Finished node: {node}")
-    print("--- WORKFLOW COMPLETE ---")
+    logger.info("Starting Agentic Workflow Execution")
+
+    try:
+        for output in app.stream(initial_payload):
+            # Output represents updates from each node
+            for node_name, state_update in output.items():
+                logger.debug(f"Node '{node_name}' completed execution")
+
+        logger.info("Workflow execution complete")
+    except Exception as e:
+        logger.critical(f"Workflow crashed: {str(e)}")
